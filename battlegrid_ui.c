@@ -50,6 +50,8 @@
 #define K_RIGHT 4
 #define K_ENTER 5
 #define K_OTHER 6
+#define K_POWER 7
+#define K_BACK 8
 
 /* messages */
 #define MSG_AIM "Use the arrow keys to aim, Enter to fire."
@@ -59,10 +61,13 @@ typedef struct {
     char name[32];
     int ship[GRID][GRID];
     char shot[GRID][GRID];
+    int guard[GRID][GRID];
+    int guardBlocked[GRID][GRID];
     int hits[SHIPS];
     int left;
     int landed;
     int points;
+    int streak;
 } Player;
 
 Player players[2];
@@ -103,6 +108,8 @@ int getKey(void) {
     if (ch == 13) {
         return K_ENTER;
     }
+    if (ch == 'p' || ch == 'P') return K_POWER;
+    if (ch == 'b' || ch == 'B') return K_BACK;
     if (ch == 0 || ch == 224) {
         ch = _getch();
         if (ch == 72) {
@@ -127,6 +134,8 @@ int getKey(void) {
     if (c == '\n' || c == '\r') {
         return K_ENTER;
     }
+    if (c == 'p' || c == 'P') return K_POWER;
+    if (c == 'b' || c == 'B') return K_BACK;
     if (c == 27) {
         if (read(STDIN_FILENO, &a, 1) <= 0) {
             return K_OTHER;
@@ -252,6 +261,8 @@ void gridRow(Player *p, int reveal, int r, int curR, int curC) {
             tile(HIT_COLOR, HIT_CHAR);
         } else if (p->shot[r][c] == MISS_CHAR) {
             tile(MISS_COLOR, MISS_CHAR);
+        } else if (reveal == 1 && p->guard[r][c] == 1) {
+            tile(C_CYAN, 'G');
         } else if (reveal == 1 && p->ship[r][c] >= 0) {
             tile(SHIP_COLOR, SHIP_CHAR);
         } else {
@@ -288,6 +299,7 @@ void gridPanel(Player *p, int yours, int mode, int i, int curR, int curC) {
     } else if (i == 13) {
         if (yours == 1) {
             legend(SHIP_COLOR, SHIP_CHAR, "ship");
+            legend(C_CYAN, 'G', "guard");
             legend(HIT_COLOR, HIT_CHAR, "hit");
             legend(MISS_COLOR, MISS_CHAR, "miss");
         } else {
@@ -432,6 +444,8 @@ void initPlayer(Player *p) {
         for (c = 0; c < GRID; c++) {
             p->ship[r][c] = -1;
             p->shot[r][c] = ' ';
+            p->guard[r][c] = 0;
+            p->guardBlocked[r][c] = 0;
         }
     }
     for (i = 0; i < SHIPS; i++) {
@@ -440,6 +454,7 @@ void initPlayer(Player *p) {
     p->left = SHIPS;
     p->landed = 0;
     p->points = 0;
+    p->streak = 0;
 }
 
 /* places a ship if it fits. Returns 1 if placed, 0 if it does not fit. */
@@ -487,6 +502,98 @@ void showMessage(int cur, int mode, const char *status, const char *msg) {
     waitEnter();
 }
 
+int chooseAction(int cur, const char *status) {
+    int choice = 0;
+    int key;
+    const char *msg;
+
+    while (1) {
+        if (choice == 0) {
+            msg = "UP/DOWN: [NAVAL GUARD]  Cross Strike | B: back";
+        } else {
+            msg = "UP/DOWN: Naval Guard  [CROSS STRIKE] | B: back";
+        }
+        drawScreen(cur, 1, -1, -1, status, msg);
+        key = getKey();
+        if (key == K_UP || key == K_DOWN) {
+            choice = 1 - choice;
+        } else if (key == K_ENTER) {
+            return choice + 1;
+        } else if (key == K_BACK) {
+            return 0;
+        }
+    }
+}
+
+int placeNavalGuard(int cur) {
+
+    Player *p = &players[cur];
+
+    int r = 0;
+    int c = 0;
+
+    char status[40];
+
+    const char *msg =
+        "Choose one of your ship tiles for Naval Guard.";
+
+    sprintf(status, "%.8s: Naval Guard", p->name);
+
+    // Check available points
+    if (p->points < 20) {
+
+        showMessage(cur, 0, status,
+            "Not enough points! Naval Guard costs 20 points.");
+
+        return 0;
+    }
+
+    while (1) {
+
+        // Select a tile on your own fleet
+        pickTile(cur, 0, &r, &c, status, msg,
+            "Choose one of your ship tiles.");
+
+        // Check if selected tile contains a ship
+        if (p->ship[r][c] < 0) {
+
+            showMessage(cur, 0, status,
+                "Invalid! Choose a tile containing your ship.");
+
+            continue;
+        }
+
+        // Check if the tile was already attacked
+        if (p->shot[r][c] != ' ') {
+
+            showMessage(cur, 0, status,
+                "Choose an unhit and unused ship tile.");
+
+            continue;
+        }
+
+        // Check if the tile already has a shield
+        if (p->guard[r][c] == 1) {
+
+            showMessage(cur, 0, status,
+                "This ship tile already has Naval Guard.");
+
+            continue;
+        }
+
+        // Activate Naval Guard
+        p->guard[r][c] = 1;
+
+        // Deduct 20 points
+        p->points -= 20;
+
+        showMessage(cur, 0, status,
+            "Naval Guard activated! 20 points deducted.");
+
+        return 1;
+    }
+}
+
 void setup(int cur) {
     Player *p = &players[cur];
     int id;
@@ -526,37 +633,192 @@ void setup(int cur) {
     clearScreen();
 }
 
+/* Performs a five-tile plus-shaped attack. Returns 1 if the player wins. */
+int crossStrike(int cur, const char *status) {
+    Player *me = &players[cur];
+    Player *enemy = &players[1 - cur];
+    int centerR = 0, centerC = 0;
+    int offsets[5][2] = {{0, 0}, {-1, 0}, {1, 0}, {0, -1}, {0, 1}};
+    int i, hits = 0, misses = 0, blocked = 0, earnedTotal = 0;
+    char summary[120];
+
+    if (me->points < 40) {
+        showMessage(cur, 1, status,
+            "Not enough points! Cross Strike costs 40 points.");
+        return 0;
+    }
+
+    pickTile(cur, 1, &centerR, &centerC, status,
+        "Choose the CENTER tile for Cross Strike.",
+        "Choose the center tile for your plus-shaped attack.");
+
+    me->points -= 40;
+
+    for (i = 0; i < 5; i++) {
+        int r = centerR + offsets[i][0];
+        int c = centerC + offsets[i][1];
+        int id, multiplier, earned;
+
+        if (r < 0 || r >= GRID || c < 0 || c >= GRID) {
+            continue;
+        }
+
+        /* Do not attack an already-used tile, except one whose shield blocked it. */
+        if (enemy->shot[r][c] != ' ') {
+            if (enemy->guardBlocked[r][c] == 1) {
+                enemy->shot[r][c] = ' ';
+                enemy->guardBlocked[r][c] = 0;
+            } else {
+                continue;
+            }
+        }
+
+        if (enemy->guard[r][c] == 1) {
+            enemy->guard[r][c] = 0;
+            enemy->guardBlocked[r][c] = 1;
+            enemy->shot[r][c] = MISS_CHAR;
+            me->streak = 0;
+            blocked++;
+            continue;
+        }
+
+        id = enemy->ship[r][c];
+        if (id < 0) {
+            enemy->shot[r][c] = MISS_CHAR;
+            me->streak = 0;
+            misses++;
+            continue;
+        }
+
+        enemy->shot[r][c] = HIT_CHAR;
+        enemy->hits[id]++;
+        me->landed++;
+        me->streak++;
+
+        if (me->streak == 1) {
+            multiplier = 1;
+        } else if (me->streak == 2) {
+            multiplier = 2;
+        } else {
+            multiplier = 3;
+        }
+
+        earned = 10 * multiplier;
+        me->points += earned;
+        earnedTotal += earned;
+        hits++;
+
+        if (enemy->hits[id] == LEN) {
+            enemy->left--;
+        }
+
+        if (enemy->left == 0) {
+            drawScreen(cur, 1, -1, -1, status, "Cross Strike sunk the last ship!");
+            return 1;
+        }
+    }
+
+    sprintf(summary,
+        "CROSS STRIKE: %d hits, %d misses, %d blocked. +%d pts. Enter.",
+        hits, misses, blocked, earnedTotal);
+    showMessage(cur, 1, status, summary);
+    return 0;
+}
+
 /* returns 1 if this player won */
 int turn(int cur) {
     Player *me = &players[cur];
     Player *enemy = &players[1 - cur];
     int curR = 0, curC = 0;
-    const char *msg = MSG_AIM;
+    int action;
+    int key;
+    const char *msg = "Arrows: aim  Enter: fire  P: power-ups";
     char status[40];
 
     sprintf(status, "%.8s's turn", me->name);
     clearScreen();
 
+    /* After fleet setup, begin immediately on the enemy targeting grid. */
     while (1) {
-        int id, result;
-        pickTile(cur, 1, &curR, &curC, status, msg, MSG_AIM);
-        msg = MSG_AIM;
+        int id, result, multiplier, earned;
+        char resultMsg[120];
 
-        if (enemy->shot[curR][curC] != ' ') {
-            msg = "Already fired there. Pick another tile.";
+        drawScreen(cur, 1, curR, curC, status, msg);
+        key = getKey();
+
+        if (key == K_UP || key == K_DOWN || key == K_LEFT || key == K_RIGHT) {
+            moveCursor(key, &curR, &curC);
+            msg = "Arrows: aim  Enter: fire  P: power-ups";
             continue;
+        }
+
+        if (key == K_POWER) {
+            action = chooseAction(cur, status);
+            if (action == 0) {
+                msg = "Back to targeting. Arrows: aim  Enter: fire  P: power-ups";
+                continue;
+            }
+            if (action == 1) {
+                placeNavalGuard(cur);
+                msg = "Naval Guard set (if valid). Choose target or press P again.";
+                continue;
+            }
+            if (action == 2) {
+                if (crossStrike(cur, status) == 1) return 1;
+                return 0;
+            }
+        }
+
+        if (key != K_ENTER) continue;
+
+        /* A shield-blocked tile may be attacked again once. */
+        if (enemy->shot[curR][curC] != ' ') {
+            if (enemy->guardBlocked[curR][curC] == 1) {
+                enemy->shot[curR][curC] = ' ';
+                enemy->guardBlocked[curR][curC] = 0;
+            } else {
+                msg = "Already fired there. Pick another tile.";
+                continue;
+            }
+        }
+
+        /* Check Naval Guard before checking whether the tile has a ship. */
+        if (enemy->guard[curR][curC] == 1) {
+            enemy->guard[curR][curC] = 0;
+            enemy->guardBlocked[curR][curC] = 1;
+            enemy->shot[curR][curC] = MISS_CHAR;
+            me->streak = 0;
+            showMessage(cur, 1, status,
+                "NAVAL GUARD BLOCKED THE ATTACK! Shield used. Turn ended.");
+            return 0;
         }
 
         id = enemy->ship[curR][curC];
         if (id < 0) {
             enemy->shot[curR][curC] = MISS_CHAR;
-            showMessage(cur, 1, status, "Miss. Press Enter to end your turn.");
+            me->streak = 0;
+            showMessage(cur, 1, status,
+                "Miss! Combo reset. Press Enter to end your turn.");
             return 0;
         }
 
         enemy->shot[curR][curC] = HIT_CHAR;
         enemy->hits[id]++;
         me->landed++;
+
+        /* Consecutive-hit multiplier: x1, x2, then x3 indefinitely. */
+        me->streak++;
+        if (me->streak == 1) {
+            multiplier = 1;
+        } else if (me->streak == 2) {
+            multiplier = 2;
+        } else {
+            multiplier = 3;
+        }
+
+        earned = 10 * multiplier;
+        me->points += earned;
+
         result = 1;
         if (enemy->hits[id] == LEN) {
             enemy->left--;
@@ -567,11 +829,17 @@ int turn(int cur) {
             drawScreen(cur, 1, -1, -1, status, "Last ship sunk!");
             return 1;
         }
+
         if (result == 2) {
-            showMessage(cur, 1, status, "Ship sunk! Press Enter to fire again.");
+            sprintf(resultMsg,
+                "SHIP SUNK! +%d points (x%d combo). Press Enter to fire again.",
+                earned, multiplier);
         } else {
-            showMessage(cur, 1, status, "Hit! Press Enter to fire again.");
+            sprintf(resultMsg,
+                "HIT! +%d points (x%d combo). Press Enter to fire again.",
+                earned, multiplier);
         }
+        showMessage(cur, 1, status, resultMsg);
     }
 }
 
