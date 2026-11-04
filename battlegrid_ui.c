@@ -36,7 +36,7 @@
 #define HIT_COLOR C_RED
 #define MISS_CHAR 'o'
 #define MISS_COLOR C_DIM
-#define AIM_CHAR '@'
+#define AIM_CHAR '+'
 #define AIM_COLOR C_AIM
 #define SHIP_CHAR '#'
 #define SHIP_COLOR C_BLUE
